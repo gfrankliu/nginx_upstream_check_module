@@ -2666,6 +2666,7 @@ ngx_http_upstream_check_status_handler(ngx_http_request_t *r)
 {
     size_t                                 buffer_size;
     ngx_int_t                              rc;
+    ngx_uint_t                             i, all_up;
     ngx_buf_t                             *b;
     ngx_chain_t                            out;
     ngx_http_upstream_check_peers_t       *peers;
@@ -2730,7 +2731,23 @@ ngx_http_upstream_check_status_handler(ngx_http_request_t *r)
 
     ctx->format->output(b, peers, ctx->flag);
 
-    r->headers_out.status = NGX_HTTP_OK;
+    ngx_http_upstream_check_peer_t *peer;
+    peer = peers->peers.elts;
+
+    // check if all peers are up or not
+    all_up = 1;
+    for (i = 0; i < peers->peers.nelts; i++) {
+        if (peer[i].shm->down) {
+            all_up = 0;
+            break;
+        }
+    }
+
+    if (all_up == 1) {
+        r->headers_out.status = NGX_HTTP_OK;
+    } else {
+        r->headers_out.status = NGX_HTTP_SERVICE_UNAVAILABLE;
+    }
     r->headers_out.content_length_n = b->last - b->pos;
 
     if (r->headers_out.content_length_n == 0) {
