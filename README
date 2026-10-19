@@ -250,6 +250,19 @@ Note
     skip peers with this flag set, with or without "zone". Servers marked
     "down" in the configuration are not checked and are never marked up.
 
+    Servers which show up in such an upstream at run time are checked too,
+    for example servers resolved with the "resolve" parameter (nginx
+    1.27.3+) or added by nginx-upsync-module. The sync notices a peer it
+    has no check for, and adds a check for its address in a slot of the
+    shared memory, shared by all the workers. The new check starts in the
+    "default_down" state. Once no worker has seen the address in the
+    upstream for 10 check intervals (at least 10 seconds), the slot is
+    released. The state of these checks is kept over a reload, and they
+    are listed on the status page like the configured servers. Half of
+    "check_shm_size" (1M by default, about 1000 slots) is reserved for
+    them; raise "check_shm_size" if nginx logs "no free slot to check
+    peer".
+
     Limitations without the patch:
 
     *   Third party load balancing methods which do not keep the round
@@ -257,14 +270,16 @@ Note
         supported; nginx logs a warning and the "check" of such an
         upstream is ignored. Use the patched core for them.
 
-    *   Only the server addresses known when the configuration is loaded
-        are checked. Servers resolved at run time with the "resolve"
-        parameter (nginx 1.27.3+) are not checked, unless the same address
-        is also known at configuration time. A peer re-created by the
-        resolver starts as up and is marked down again by the next sync.
-
     *   A server goes down in the balancers up to one sync period after
-        the check marks it down.
+        the check marks it down. A server added at run time takes traffic
+        until the next sync, when it gets its "default_down" state, and a
+        peer re-created by the resolver starts as up until the next sync.
+
+    *   nginx-upsync-module: servers in the file named by "upsync_dump_path"
+        are configured servers once nginx reloads, and stay checked (and
+        listed on the status page) until the next reload, even if upsync
+        removes them. Its own check hooks (NGX_HTTP_UPSTREAM_CHECK) are not
+        used, nor needed, without the patch.
 
     The tests for the unpatched mode are in test/patchless/.
 

@@ -18,5 +18,17 @@ with check_keepalive_requests > 1. PORT_BASE (default 18080) moves the
 ports so several builds can be tested at once.
 
 resolve_test.py <build> (nginx 1.27.3+) uses a small DNS responder
-(dns.py) that keeps removing and re-adding a "resolve" server, and checks
-that the re-created peer is marked down again.
+(dns.py). A "resolve" server whose address is not in the configuration
+must be checked as a dynamic peer: down while its backend is dead, up once
+it comes back, kept over a reload, and its check slot released once the
+name stops resolving. Another "resolve" server keeps being removed and
+re-added by the resolver, and must be marked down again each time.
+
+upsync_test.py <build> needs nginx built with nginx-upsync-module as well
+(https://github.com/weibocom/nginx-upsync-module). It serves the servers
+from a fake consul (consul.py) and checks that servers added by upsync are
+checked, that dead ones get no traffic, that they recover, that removed
+ones have their check slots released, and that state is kept over a
+reload.
+
+common.py holds the helpers shared by resolve_test.py and upsync_test.py.

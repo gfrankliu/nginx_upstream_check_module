@@ -1,10 +1,24 @@
-# usage: resolve_test.py <build_dir>   (nginx 1.27.3+, zone + resolve)
-import json, os, re, subprocess, sys, time, urllib.request
-S = os.path.dirname(os.path.abspath(__file__))
-build = sys.argv[1]; inst = os.path.join(build, "inst"); nginx = os.path.join(inst, "sbin/nginx")
-dynamic = os.path.exists(os.path.join(inst, "modules/ngx_http_upstream_check_module.so"))
-NG, A, C, CTL, DNS = 19080, 19081, 19083, 19090, 19053
-conf = """
+# usage: resolve_test.py <build>   (nginx 1.27.3+: zone + "resolve")
+#
+# - "dyn.test" resolves to an address which is not in the configuration:
+#   the module checks it as a dynamic peer, marks it down while its backend
+#   is dead, up once it comes back, keeps its state over a reload, and
+#   releases the check slot once the name no longer resolves.
+# - "flap.test" resolves to a configured (dead) address and NXDOMAIN on
+#   alternate queries, so nginx keeps re-creating the peer, which must be
+#   marked down again every time.
+import json, os, re, subprocess, sys, time
+here = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, here)
+from common import *
+
+build = sys.argv[1]
+base = int(os.environ.get("PORT_BASE", "19080"))
+NG, A, C, E, CTL, DNS = base, base + 1, base + 3, base + 5, base + 10, base + 53
+ng = Nginx(build, "resolve.conf", NG)
+control = os.path.join(ng.inst, "conf/dns.json")
+json.dump({"dyn.test": "127.0.0.1", "flap.test": "flap"}, open(control, "w"))
+
+ng.write("""
 %s
 worker_processes 2;
 error_log logs/error.log debug;
@@ -18,6 +32,7 @@ http {
         resolver 127.0.0.1:%d valid=1s;
         server 127.0.0.1:%d;
         server 127.0.0.1:%d;
+        server flap.test:%d resolve;
         server dyn.test:%d resolve;
         check interval=300 rise=1 fall=1 timeout=500 type=http;
         check_http_send "GET /health HTTP/1.0\\r\\n\\r\\n";
@@ -28,32 +43,53 @@ http {
         location /status { check_status json; }
     }
 }
-""" % ('load_module modules/ngx_http_upstream_check_module.so;' if dynamic else '', DNS, A, C, C, NG)
-open(os.path.join(inst, "conf/resolve.conf"), "w").write(conf)
-for f in ("access.log", "error.log"):
-    p = os.path.join(inst, "logs", f)
-    if os.path.exists(p): os.unlink(p)
-dns = subprocess.Popen([sys.executable, "-I", os.path.join(S, "dns.py"), str(DNS)])
-be = subprocess.Popen([sys.executable, "-I", os.path.join(S, "backend.py"), str(CTL)], stderr=subprocess.DEVNULL)
-time.sleep(0.5)
-urllib.request.urlopen("http://127.0.0.1:%d/start?port=%d" % (CTL, A)).read()
-fail = 0
+""" % (ng.load("ngx_http_upstream_check_module"), DNS, A, C, C, E, NG))
+
+dns = subprocess.Popen([sys.executable, "-I", os.path.join(here, "dns.py"), str(DNS), control])
+be = Backends(here, CTL)
+be("/start?port=%d" % A)
+dynE = ("rs", "127.0.0.1:%d" % E)
 try:
-    subprocess.run([nginx, "-p", inst, "-c", "conf/resolve.conf"], check=True)
-    time.sleep(2)
-    for i in range(80):
-        try: urllib.request.urlopen("http://127.0.0.1:%d/?i=%d" % (NG, i), timeout=3).read()
-        except Exception as e: print("request error", e); fail = 1
-        time.sleep(0.1)
-    log = open(os.path.join(inst, "logs/error.log")).read()
-    marks = re.findall(r"http check sync peer 127\.0\.0\.1:%d in upstream rs: down" % C, log)
-    print("resolved peer re-marked down %d times" % len(marks))
-    if len(marks) < 3: fail = 1
-    acc = open(os.path.join(inst, "logs/access.log")).read()
-    print("requests that tried C: %d of 80" % acc.count(":%d" % C))
-    crit = [l for l in log.splitlines() if re.search(r"\[(alert|crit|emerg)\]", l)]
-    print("alerts:", crit[:3]); fail |= bool(crit)
+    ng.start()
+    print("== resolve %s dynamic=%s" % (os.path.basename(build), ng.dynamic))
+
+    st = ng.wait_status({("rs", "127.0.0.1:%d" % A): "up", dynE: "down"})
+    check(st.get(dynE) == "down", "resolve-only server is checked and down while dead: %s" % st)
+    time.sleep(0.8)
+    codes, ports = ng.burst(100)
+    check(set(codes) == {200} and E not in ports, "no traffic to the dead resolved server: %s" % ports)
+
+    be("/start?port=%d" % E)
+    st = ng.wait_status({dynE: "up"})
+    check(st.get(dynE) == "up", "resolved server comes up when its backend starts")
+    time.sleep(0.8)
+    codes, ports = ng.burst(100)
+    check(set(codes) == {200} and ports.get(E, 0) > 0, "resolved server gets traffic: %s" % ports)
+
+    # state is kept over a reload (default_down would make it down)
+    ng.signal("reload")
+    time.sleep(1.0)
+    st = ng.status()
+    check(st.get(dynE) == "up", "resolved server is still up right after reload: %s" % st.get(dynE))
+
+    be("/stop?port=%d" % E)
+    st = ng.wait_status({dynE: "down"})
+    check(st.get(dynE) == "down", "resolved server goes down when its backend stops")
+    time.sleep(0.8)
+    codes, ports = ng.burst(100)
+    check(set(codes) == {200} and E not in ports, "no traffic to it once down: %s" % ports)
+
+    marks = re.findall(r"http check sync peer 127\.0\.0\.1:%d in upstream rs: down" % C, ng.log("error.log"))
+    check(len(marks) >= 2, "re-created flap.test peer re-marked down %d times" % len(marks))
+
+    # name gone: the check slot is released after the grace period (10s)
+    json.dump({"flap.test": "flap"}, open(control, "w"))
+    st = ng.wait_status({dynE: None}, secs=25)
+    check(dynE not in st, "check slot released once the name no longer resolves")
+    check("release dynamic check peer 127.0.0.1:%d" % E in ng.log("error.log"), "release is logged")
+
+    check(not ng.alerts(), "no alerts/crashes: %s" % ng.alerts()[:3])
 finally:
-    subprocess.run([nginx, "-p", inst, "-c", "conf/resolve.conf", "-s", "stop"]); time.sleep(0.5)
+    ng.signal("stop"); time.sleep(0.5)
     be.kill(); dns.kill()
-print("RESOLVE", os.path.basename(build), "PASS" if not fail else "FAIL")
+done("resolve " + os.path.basename(build))
