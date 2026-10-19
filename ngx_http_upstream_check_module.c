@@ -8,6 +8,22 @@
 #include "ngx_http_upstream_check_module.h"
 
 
+/*
+ * NGX_HTTP_UPSTREAM_CHECK is defined by the "config" script only when the
+ * nginx core has been patched with one of the check_*.patch files. In that
+ * case the core balancers ask this module whether a peer is down.
+ *
+ * Without the patch, the module registers the round robin peers of every
+ * upstream with "check" itself, and each worker periodically copies the
+ * check status into the peers' "down" flag, which all the built-in
+ * balancers honour.
+ */
+
+#if !(NGX_HTTP_UPSTREAM_CHECK) && (nginx_version < 1009000)
+#error "nginx versions before 1.9.0 need one of the check_*.patch files"
+#endif
+
+
 typedef struct ngx_http_upstream_check_peer_s ngx_http_upstream_check_peer_t;
 typedef struct ngx_http_upstream_check_srv_conf_s
     ngx_http_upstream_check_srv_conf_t;
@@ -142,6 +158,26 @@ struct ngx_http_upstream_check_peer_s {
 };
 
 
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+
+/*
+ * The value put into ngx_http_upstream_rr_peer_t.down for the peers which
+ * fail the checks. The value from the configuration is 0 or 1, so this
+ * leaves the servers marked "down" in the configuration alone.
+ */
+#define NGX_HTTP_UPSTREAM_CHECK_PEER_DOWN    2
+
+typedef struct {
+    ngx_http_upstream_srv_conf_t            *upstream;
+
+    /* the check peers of this upstream: [first, first + number) */
+    ngx_uint_t                               first;
+    ngx_uint_t                               number;
+} ngx_http_upstream_check_upstream_t;
+
+#endif
+
+
 typedef struct {
     ngx_str_t                                check_shm_name;
     ngx_uint_t                               generation;
@@ -149,6 +185,12 @@ typedef struct {
     ngx_array_t                              peers;
 
     ngx_http_upstream_check_peers_shm_t     *peers_shm;
+
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+    /* ngx_http_upstream_check_upstream_t */
+    ngx_array_t                              upstreams;
+    ngx_msec_t                               sync_interval;
+#endif
 } ngx_http_upstream_check_peers_t;
 
 
@@ -485,6 +527,23 @@ static ngx_int_t ngx_http_upstream_check_init_shm_zone(
 static ngx_int_t ngx_http_upstream_check_init_module(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_upstream_check_init_process(ngx_cycle_t *cycle);
 
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+static ngx_int_t ngx_http_upstream_check_postconfiguration(ngx_conf_t *cf);
+static ngx_int_t ngx_http_upstream_check_add_upstream(ngx_conf_t *cf,
+    ngx_http_upstream_srv_conf_t *us);
+static ngx_int_t ngx_http_upstream_check_init_sync(ngx_cycle_t *cycle);
+static void ngx_http_upstream_check_sync_handler(ngx_event_t *event);
+static void ngx_http_upstream_check_sync_peers(void);
+static ngx_uint_t ngx_http_upstream_check_sync_list(
+    ngx_http_upstream_check_upstream_t *cu,
+    ngx_http_upstream_rr_peers_t *peers, ngx_uint_t update);
+static ngx_int_t ngx_http_upstream_check_find_rr_peer(
+    ngx_http_upstream_check_upstream_t *cu, ngx_http_upstream_rr_peer_t *peer,
+    ngx_uint_t hint);
+static ngx_int_t ngx_http_upstream_check_cmp_sockaddr(struct sockaddr *sa1,
+    socklen_t slen1, struct sockaddr *sa2, socklen_t slen2);
+#endif
+
 
 static ngx_conf_bitmask_t  ngx_check_http_expect_alive_masks[] = {
     { ngx_string("http_2xx"), NGX_CHECK_HTTP_2XX },
@@ -552,7 +611,11 @@ static ngx_command_t  ngx_http_upstream_check_commands[] = {
 
 static ngx_http_module_t  ngx_http_upstream_check_module_ctx = {
     NULL,                                    /* preconfiguration */
+#if (NGX_HTTP_UPSTREAM_CHECK)
     NULL,                                    /* postconfiguration */
+#else
+    ngx_http_upstream_check_postconfiguration, /* postconfiguration */
+#endif
 
     ngx_http_upstream_check_create_main_conf,/* create main configuration */
     ngx_http_upstream_check_init_main_conf,  /* init main configuration */
@@ -767,6 +830,10 @@ static ngx_uint_t ngx_http_upstream_check_shm_generation = 0;
 static ngx_http_upstream_check_peers_t *check_peers_ctx = NULL;
 /* peers of the configuration being loaded, used until it is committed */
 static ngx_http_upstream_check_peers_t *check_peers_conf = NULL;
+
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+static ngx_event_t ngx_http_upstream_check_sync_event;
+#endif
 
 
 ngx_uint_t
@@ -2640,6 +2707,12 @@ ngx_http_upstream_check_clear_all_events()
 
     has_cleared = 1;
 
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+    if (ngx_http_upstream_check_sync_event.timer_set) {
+        ngx_del_timer(&ngx_http_upstream_check_sync_event);
+    }
+#endif
+
     ngx_http_upstream_check_clear_peers_events(check_peers_ctx);
 }
 
@@ -3446,6 +3519,16 @@ ngx_http_upstream_check_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
 
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+    if (ngx_array_init(&ucmcf->peers->upstreams, cf->pool, 4,
+                       sizeof(ngx_http_upstream_check_upstream_t)) != NGX_OK)
+    {
+        return NULL;
+    }
+
+    ucmcf->peers->sync_interval = 500;
+#endif
+
     return ucmcf;
 }
 
@@ -3586,7 +3669,15 @@ ngx_http_upstream_check_init_main_conf(ngx_conf_t *cf, void *conf)
         }
     }
 
+#if (NGX_HTTP_UPSTREAM_CHECK)
     return ngx_http_upstream_check_init_shm(cf, conf);
+#else
+    /*
+     * The upstream peers may not be initialized yet, so they are registered
+     * and the shared memory is added in the postconfiguration handler.
+     */
+    return NGX_CONF_OK;
+#endif
 }
 
 
@@ -4123,5 +4214,391 @@ ngx_http_upstream_check_init_process(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
-    return ngx_http_upstream_check_add_timers(cycle);
+    if (ngx_http_upstream_check_add_timers(cycle) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+    return ngx_http_upstream_check_init_sync(cycle);
+#else
+    return NGX_OK;
+#endif
 }
+
+
+#if !(NGX_HTTP_UPSTREAM_CHECK)
+
+static ngx_int_t
+ngx_http_upstream_check_postconfiguration(ngx_conf_t *cf)
+{
+    ngx_uint_t                            i;
+    ngx_http_upstream_srv_conf_t        **uscfp;
+    ngx_http_upstream_main_conf_t        *umcf;
+    ngx_http_upstream_check_main_conf_t  *ucmcf;
+
+    umcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_upstream_module);
+    ucmcf = ngx_http_conf_get_module_main_conf(cf,
+                                               ngx_http_upstream_check_module);
+
+    uscfp = umcf->upstreams.elts;
+
+    for (i = 0; i < umcf->upstreams.nelts; i++) {
+        if (ngx_http_upstream_check_add_upstream(cf, uscfp[i]) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (ngx_http_upstream_check_init_shm(cf, ucmcf) != NGX_CONF_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_add_upstream(ngx_conf_t *cf,
+    ngx_http_upstream_srv_conf_t *us)
+{
+    ngx_uint_t                            first;
+    ngx_msec_t                            interval;
+    ngx_addr_t                           *addr;
+    ngx_http_upstream_rr_peer_t          *peer;
+    ngx_http_upstream_rr_peers_t         *peers, *list;
+    ngx_http_upstream_check_upstream_t   *cu;
+    ngx_http_upstream_check_srv_conf_t   *ucscf;
+    ngx_http_upstream_check_main_conf_t  *ucmcf;
+
+    if (us->srv_conf == NULL) {
+        return NGX_OK;
+    }
+
+    ucscf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_check_module);
+
+    if (ucscf->check_interval == 0) {
+        return NGX_OK;
+    }
+
+    /*
+     * All the built-in balancers (round robin, hash, ip_hash, least_conn,
+     * random) keep the round robin peers in us->peer.data, and those always
+     * point back to the upstream name.
+     */
+
+    peers = us->peer.data;
+
+    if (peers == NULL || peers->name != &us->host) {
+        ngx_log_error(NGX_LOG_WARN, cf->log, 0,
+                      "upstream check is ignored for upstream \"%V\" "
+                      "in %s:%ui: its load balancing method is not "
+                      "supported without the check patch",
+                      &us->host, us->file_name, us->line);
+        return NGX_OK;
+    }
+
+    ucmcf = ngx_http_conf_get_module_main_conf(cf,
+                                               ngx_http_upstream_check_module);
+
+    first = ucmcf->peers->peers.nelts;
+
+    /* primary peers, then backup peers */
+
+    for (list = peers; list; list = list->next) {
+
+        /*
+         * Servers resolved at run time ("resolve") are not in this list
+         * yet, only the addresses known at configuration time are checked.
+         */
+
+        for (peer = list->peer; peer; peer = peer->next) {
+
+            if (peer->down) {
+                continue;
+            }
+
+            addr = ngx_palloc(cf->pool, sizeof(ngx_addr_t));
+            if (addr == NULL) {
+                return NGX_ERROR;
+            }
+
+            addr->sockaddr = peer->sockaddr;
+            addr->socklen = peer->socklen;
+            addr->name = peer->name;
+
+            if (ngx_http_upstream_check_add_peer(cf, us, addr)
+                == (ngx_uint_t) NGX_ERROR)
+            {
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    cu = ngx_array_push(&ucmcf->peers->upstreams);
+    if (cu == NULL) {
+        return NGX_ERROR;
+    }
+
+    cu->upstream = us;
+    cu->first = first;
+    cu->number = ucmcf->peers->peers.nelts - first;
+
+    interval = ucscf->check_interval / 2;
+
+    if (interval < 100) {
+        interval = 100;
+    }
+
+    if (interval < ucmcf->peers->sync_interval) {
+        ucmcf->peers->sync_interval = interval;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_init_sync(ngx_cycle_t *cycle)
+{
+    ngx_event_t  *ev;
+
+    if (check_peers_ctx == NULL
+        || check_peers_ctx->peers_shm == NULL
+        || check_peers_ctx->upstreams.nelts == 0)
+    {
+        return NGX_OK;
+    }
+
+    ngx_http_upstream_check_sync_peers();
+
+    ev = &ngx_http_upstream_check_sync_event;
+
+    ev->handler = ngx_http_upstream_check_sync_handler;
+    ev->log = cycle->log;
+    ev->data = check_peers_ctx;
+
+    ngx_add_timer(ev, check_peers_ctx->sync_interval);
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_upstream_check_sync_handler(ngx_event_t *event)
+{
+    if (ngx_http_upstream_check_need_exit()) {
+        return;
+    }
+
+    /* with "master_process off" a reload may leave no peers to check */
+
+    if (check_peers_ctx == NULL || check_peers_ctx->upstreams.nelts == 0) {
+        return;
+    }
+
+    ngx_http_upstream_check_sync_peers();
+
+    ngx_add_timer(event, check_peers_ctx->sync_interval);
+}
+
+
+static void
+ngx_http_upstream_check_sync_peers(void)
+{
+    ngx_uint_t                           i;
+    ngx_http_upstream_rr_peers_t        *peers;
+    ngx_http_upstream_check_upstream_t  *cu;
+
+    if (check_peers_ctx == NULL || check_peers_ctx->peers_shm == NULL) {
+        return;
+    }
+
+    cu = check_peers_ctx->upstreams.elts;
+
+    for (i = 0; i < check_peers_ctx->upstreams.nelts; i++) {
+
+        /*
+         * With "zone", us->peer.data points to the copy of the peers
+         * in the shared memory, which all the workers update.
+         */
+
+        for (peers = cu[i].upstream->peer.data; peers; peers = peers->next) {
+
+            ngx_http_upstream_rr_peers_rlock(peers);
+
+            if (ngx_http_upstream_check_sync_list(&cu[i], peers, 0) == 0) {
+                ngx_http_upstream_rr_peers_unlock(peers);
+                continue;
+            }
+
+            ngx_http_upstream_rr_peers_unlock(peers);
+
+            ngx_http_upstream_rr_peers_wlock(peers);
+
+            (void) ngx_http_upstream_check_sync_list(&cu[i], peers, 1);
+
+            ngx_http_upstream_rr_peers_unlock(peers);
+        }
+    }
+}
+
+
+static ngx_uint_t
+ngx_http_upstream_check_sync_list(ngx_http_upstream_check_upstream_t *cu,
+    ngx_http_upstream_rr_peers_t *peers, ngx_uint_t update)
+{
+    ngx_int_t                        index;
+    ngx_uint_t                       hint, down, changed;
+    ngx_http_upstream_rr_peer_t     *peer;
+    ngx_http_upstream_check_peer_t  *cpeer;
+
+    cpeer = check_peers_ctx->peers.elts;
+
+    changed = 0;
+    hint = cu->first;
+
+    for (peer = peers->peer; peer; peer = peer->next) {
+
+        /*
+         * Leave the servers marked "down" in the configuration, or by
+         * anything else, alone.
+         */
+
+        if (peer->down != 0 && peer->down != NGX_HTTP_UPSTREAM_CHECK_PEER_DOWN)
+        {
+            continue;
+        }
+
+        /*
+         * The peers are matched by address on every pass, since with
+         * "resolve" the peers may be recreated at run time.
+         */
+
+        down = 0;
+
+        index = ngx_http_upstream_check_find_rr_peer(cu, peer, hint);
+
+        if (index != NGX_ERROR) {
+            hint = index + 1;
+
+            if (cpeer[index].shm->down) {
+                down = NGX_HTTP_UPSTREAM_CHECK_PEER_DOWN;
+            }
+        }
+
+        if (peer->down == down) {
+            continue;
+        }
+
+        changed++;
+
+        if (update) {
+            ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                           "http check sync peer %V in upstream %V: %s",
+                           &peer->name, &cu->upstream->host,
+                           down ? "down" : "up");
+
+            peer->down = down;
+        }
+    }
+
+    return changed;
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_find_rr_peer(ngx_http_upstream_check_upstream_t *cu,
+    ngx_http_upstream_rr_peer_t *peer, ngx_uint_t hint)
+{
+    ngx_uint_t                       i, last;
+    ngx_addr_t                      *addr;
+    ngx_http_upstream_check_peer_t  *cpeer;
+
+    cpeer = check_peers_ctx->peers.elts;
+    last = cu->first + cu->number;
+
+    /* the peers are usually in the order they were registered in */
+
+    if (hint < last) {
+        addr = cpeer[hint].peer_addr;
+
+        if (ngx_http_upstream_check_cmp_sockaddr(addr->sockaddr, addr->socklen,
+                                                 peer->sockaddr, peer->socklen)
+            == NGX_OK)
+        {
+            return hint;
+        }
+    }
+
+    for (i = cu->first; i < last; i++) {
+        addr = cpeer[i].peer_addr;
+
+        if (ngx_http_upstream_check_cmp_sockaddr(addr->sockaddr, addr->socklen,
+                                                 peer->sockaddr, peer->socklen)
+            == NGX_OK)
+        {
+            return i;
+        }
+    }
+
+    return NGX_ERROR;
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_cmp_sockaddr(struct sockaddr *sa1, socklen_t slen1,
+    struct sockaddr *sa2, socklen_t slen2)
+{
+    struct sockaddr_in   *sin1, *sin2;
+#if (NGX_HAVE_INET6)
+    struct sockaddr_in6  *sin61, *sin62;
+#endif
+
+    if (sa1->sa_family != sa2->sa_family) {
+        return NGX_DECLINED;
+    }
+
+    switch (sa1->sa_family) {
+
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+
+        sin61 = (struct sockaddr_in6 *) sa1;
+        sin62 = (struct sockaddr_in6 *) sa2;
+
+        if (sin61->sin6_port != sin62->sin6_port) {
+            return NGX_DECLINED;
+        }
+
+        if (ngx_memcmp(&sin61->sin6_addr, &sin62->sin6_addr, 16) != 0) {
+            return NGX_DECLINED;
+        }
+
+        return NGX_OK;
+#endif
+
+    case AF_INET:
+
+        sin1 = (struct sockaddr_in *) sa1;
+        sin2 = (struct sockaddr_in *) sa2;
+
+        if (sin1->sin_port != sin2->sin_port) {
+            return NGX_DECLINED;
+        }
+
+        if (sin1->sin_addr.s_addr != sin2->sin_addr.s_addr) {
+            return NGX_DECLINED;
+        }
+
+        return NGX_OK;
+
+    default: /* AF_UNIX */
+
+        if (slen1 != slen2 || ngx_memcmp(sa1, sa2, slen1) != 0) {
+            return NGX_DECLINED;
+        }
+
+        return NGX_OK;
+    }
+}
+
+#endif

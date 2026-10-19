@@ -1,0 +1,22 @@
+Runtime tests for the module built against unpatched nginx.
+
+Build nginx with the module and install it into <build>/inst, e.g.
+
+    ./configure --prefix=<build>/inst --add-dynamic-module=/path/to/module
+    make && make install
+
+then run, for each load balancing method and with/without "zone":
+
+    python3 run_test.py <build> rr|hash|chash|ip_hash|least_conn|random|random2 0|1
+
+run_test.py starts Python backends (backend.py): A is healthy, B serves
+traffic but fails /health, C is not running, D is healthy but marked
+"down" in the configuration. It checks the status page, that no request
+reaches B, C or D while they are down, that B and C get traffic again
+once they recover, backup servers, reload, and that checks keep running
+with check_keepalive_requests > 1. PORT_BASE (default 18080) moves the
+ports so several builds can be tested at once.
+
+resolve_test.py <build> (nginx 1.27.3+) uses a small DNS responder
+(dns.py) that keeps removing and re-adding a "resolve" server, and checks
+that the re-created peer is marked down again.

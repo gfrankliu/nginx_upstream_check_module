@@ -219,21 +219,66 @@ Installation
     Download the latest version of the release tarball of this module from
     github (<http://github.com/yaoweibin/nginx_upstream_check_module>)
 
-    Grab the nginx source code from nginx.org (<http://nginx.org/>), for
-    example, the version 1.0.14 (see nginx compatibility), and then build
-    the source with this module:
+    Grab the nginx source code from nginx.org (<http://nginx.org/>), and
+    build it with this module. Since nginx 1.9.0 no patch to the nginx core
+    is needed, and the module can be built either statically or as a
+    dynamic module:
 
-        $ wget 'http://nginx.org/download/nginx-1.0.14.tar.gz'
-        $ tar -xzvf nginx-1.0.14.tar.gz
-        $ cd nginx-1.0.14/
-        $ patch -p1 < /path/to/nginx_http_upstream_check_module/check.patch
+        $ wget 'http://nginx.org/download/nginx-1.30.6.tar.gz'
+        $ tar -xzvf nginx-1.30.6.tar.gz
+        $ cd nginx-1.30.6/
 
         $ ./configure --add-module=/path/to/nginx_http_upstream_check_module
+        or
+        $ ./configure --add-dynamic-module=/path/to/nginx_http_upstream_check_module
 
         $ make
         $ make install
 
+    For the dynamic module, load it at the top of nginx.conf:
+
+        load_module modules/ngx_http_upstream_check_module.so;
+
 Note
+    How it works without the patch: when the configuration is loaded, the
+    module registers the servers of every upstream with "check" from the
+    upstream's round robin peers, matching them by address. Every worker
+    then copies the check status from the shared memory into the peers'
+    "down" flag at least every 500 milliseconds (or every half of the
+    smallest check interval). All the built-in load balancing methods
+    (round robin, hash, hash consistent, ip_hash, least_conn and random)
+    skip peers with this flag set, with or without "zone". Servers marked
+    "down" in the configuration are not checked and are never marked up.
+
+    Limitations without the patch:
+
+    *   Third party load balancing methods which do not keep the round
+        robin peers in the upstream (for example upstream fair) are not
+        supported; nginx logs a warning and the "check" of such an
+        upstream is ignored. Use the patched core for them.
+
+    *   Only the server addresses known when the configuration is loaded
+        are checked. Servers resolved at run time with the "resolve"
+        parameter (nginx 1.27.3+) are not checked, unless the same address
+        is also known at configuration time. A peer re-created by the
+        resolver starts as up and is marked down again by the next sync.
+
+    *   A server goes down in the balancers up to one sync period after
+        the check marks it down.
+
+    The tests for the unpatched mode are in test/patchless/.
+
+    Patching the nginx core, as in the older versions of this module, is
+    still supported. The "config" script detects a patched core and then
+    builds the module in the patched mode (NGX_HTTP_UPSTREAM_CHECK is
+    defined and the balancers call into the module directly). The patched
+    mode needs --add-module, it cannot be built as a dynamic module. It is
+    required for nginx versions before 1.9.0 and for the patched third
+    party modules below. To use it, apply the patch matching your nginx
+    version before running configure:
+
+        $ patch -p1 < /path/to/nginx_http_upstream_check_module/check_1.20.1+.patch
+
     If you use nginx-1.2.1 or nginx-1.3.0, the nginx upstream round robin
     module changed greatly. You should use the patch named
     'check_1.2.1.patch'.
