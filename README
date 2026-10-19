@@ -111,6 +111,16 @@ Directives
             fastcgi response to diagnose if the upstream server is alive.
             This type is only available in http upstreams.
 
+    Each server is checked once per interval, however many worker
+    processes there are. If the same server (address and port) is listed
+    in several upstreams, or twice in one, and all its check settings are
+    the same (check, check_keepalive_requests, check_http_send,
+    check_http_expect_alive and check_fastcgi_param), it is checked only
+    once and all its entries share the result. They are still listed
+    separately on the status page. If any of the settings differ, e.g. a
+    different Host header in check_http_send, each upstream checks the
+    server on its own.
+
   check_http_send
     syntax: *check_http_send http_packet*
 

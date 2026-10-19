@@ -180,6 +180,14 @@ struct ngx_http_upstream_check_peer_s {
     ngx_http_upstream_check_peer_shm_t      *shm;
     ngx_http_upstream_check_srv_conf_t      *conf;
 
+    /*
+     * Set if an earlier peer (shared_index) has the same address and the
+     * same check settings: this peer uses its check and status instead of
+     * running one of its own, see ngx_http_upstream_check_share_peers().
+     */
+    ngx_uint_t                               shared;
+    ngx_uint_t                               shared_index;
+
 #if !(NGX_HTTP_UPSTREAM_CHECK)
     /* the id of the shared memory slot of a dynamic peer, 0 otherwise */
     ngx_uint_t                               dyn_id;
@@ -613,9 +621,14 @@ static void ngx_http_upstream_check_dyn_inherit(
     ngx_http_upstream_check_peers_shm_t *opeers_shm);
 static ngx_int_t ngx_http_upstream_check_dyn_status(ngx_http_request_t *r,
     ngx_http_upstream_check_peers_t *peers, ngx_array_t *records);
+#endif
+
 static ngx_int_t ngx_http_upstream_check_cmp_sockaddr(struct sockaddr *sa1,
     socklen_t slen1, struct sockaddr *sa2, socklen_t slen2);
-#endif
+static void ngx_http_upstream_check_share_peers(
+    ngx_http_upstream_check_peers_t *peers);
+static ngx_int_t ngx_http_upstream_check_same_check(
+    ngx_http_upstream_check_peer_t *p1, ngx_http_upstream_check_peer_t *p2);
 
 
 static ngx_conf_bitmask_t  ngx_check_http_expect_alive_masks[] = {
@@ -1202,6 +1215,13 @@ ngx_http_upstream_check_add_timers(ngx_cycle_t *cycle)
     peer_shm = peers_shm->peers;
 
     for (i = 0; i < peers->peers.nelts; i++) {
+
+        if (peer[i].shared) {
+            /* the peer it shares the check with runs it */
+            peer[i].shm = peer[peer[i].shared_index].shm;
+            continue;
+        }
+
         peer[i].shm = &peer_shm[i];
 
         if (ngx_http_upstream_check_init_peer(&peer[i], cycle->log) != NGX_OK) {
@@ -4330,6 +4350,8 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     }
 #endif
 
+    ngx_http_upstream_check_share_peers(peers);
+
     peer = peers->peers.elts;
 
     for (i = 0; i < number; i++) {
@@ -4339,8 +4361,11 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         /*
          * Set it here rather than in init_process, so that it is valid
          * in every process type, including "master_process off".
+         * A shared peer uses the slot of the peer it shares the check with,
+         * which comes earlier, so its shm is already set.
          */
-        peer[i].shm = peer_shm;
+        peer[i].shm = peer[i].shared ? peer[peer[i].shared_index].shm
+                                     : peer_shm;
 
         /*
          * This function may be triggered before the old stale
@@ -5622,6 +5647,8 @@ ngx_http_upstream_check_dyn_status(ngx_http_request_t *r,
     return NGX_OK;
 }
 
+#endif
+
 
 static ngx_int_t
 ngx_http_upstream_check_cmp_sockaddr(struct sockaddr *sa1, socklen_t slen1,
@@ -5680,4 +5707,134 @@ ngx_http_upstream_check_cmp_sockaddr(struct sockaddr *sa1, socklen_t slen1,
     }
 }
 
-#endif
+
+/*
+ * Several upstreams may list the same server, e.g.
+ *
+ *     upstream vh01 { server server1:8080; ... check ...; }
+ *     upstream vh02 { server server1:8080; ... check ...; }
+ *
+ * If the address checked and all the check settings are the same, the
+ * server is checked once: the later peers use the check and the status of
+ * the first one. They are still listed separately on the status page.
+ * Peers added at run time are not shared.
+ */
+
+static void
+ngx_http_upstream_check_share_peers(ngx_http_upstream_check_peers_t *peers)
+{
+    ngx_uint_t                       i, j;
+    ngx_http_upstream_check_peer_t  *peer;
+
+    peer = peers->peers.elts;
+
+    for (i = 0; i < peers->peers.nelts; i++) {
+
+        peer[i].shared = 0;
+
+        for (j = 0; j < i; j++) {
+
+            if (peer[j].shared) {
+                continue;
+            }
+
+            if (ngx_http_upstream_check_same_check(&peer[i], &peer[j])
+                == NGX_OK)
+            {
+                peer[i].shared = 1;
+                peer[i].shared_index = j;
+
+                ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                               "http check peer %V in upstream %V shares "
+                               "the check of index %ui",
+                               &peer[i].check_peer_addr->name,
+                               peer[i].upstream_name, j);
+                break;
+            }
+        }
+    }
+}
+
+
+static ngx_int_t
+ngx_http_upstream_check_same_check(ngx_http_upstream_check_peer_t *p1,
+    ngx_http_upstream_check_peer_t *p2)
+{
+    ngx_uint_t                           i, n1, n2;
+    ngx_str_t                           *s1, *s2;
+    ngx_http_upstream_check_srv_conf_t  *c1, *c2;
+
+    if (ngx_http_upstream_check_cmp_sockaddr(p1->check_peer_addr->sockaddr,
+                                             p1->check_peer_addr->socklen,
+                                             p2->check_peer_addr->sockaddr,
+                                             p2->check_peer_addr->socklen)
+        != NGX_OK)
+    {
+        return NGX_DECLINED;
+    }
+
+    c1 = p1->conf;
+    c2 = p2->conf;
+
+    if (c1 == c2) {
+        /* the same server twice in one upstream */
+        return NGX_OK;
+    }
+
+    /* check */
+
+    if (c1->check_type_conf != c2->check_type_conf
+        || c1->check_interval != c2->check_interval
+        || c1->check_timeout != c2->check_timeout
+        || c1->rise_count != c2->rise_count
+        || c1->fall_count != c2->fall_count
+        || c1->default_down != c2->default_down
+        || c1->port != c2->port)
+    {
+        return NGX_DECLINED;
+    }
+
+    /* check_keepalive_requests */
+
+    if (c1->check_keepalive_requests != c2->check_keepalive_requests) {
+        return NGX_DECLINED;
+    }
+
+    /* check_http_send */
+
+    if (c1->send.len != c2->send.len
+        || ngx_memcmp(c1->send.data, c2->send.data, c1->send.len) != 0)
+    {
+        return NGX_DECLINED;
+    }
+
+    /* check_http_expect_alive */
+
+    if (c1->code.status_alive != c2->code.status_alive) {
+        return NGX_DECLINED;
+    }
+
+    /* check_fastcgi_param */
+
+    n1 = c1->fastcgi_params ? c1->fastcgi_params->nelts : 0;
+    n2 = c2->fastcgi_params ? c2->fastcgi_params->nelts : 0;
+
+    if (n1 != n2) {
+        return NGX_DECLINED;
+    }
+
+    if (n1) {
+        s1 = c1->fastcgi_params->elts;
+        s2 = c2->fastcgi_params->elts;
+
+        for (i = 0; i < n1; i++) {
+            if (s1[i].len != s2[i].len
+                || ngx_memcmp(s1[i].data, s2[i].data, s1[i].len) != 0)
+            {
+                return NGX_DECLINED;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
