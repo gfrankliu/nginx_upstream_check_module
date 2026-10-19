@@ -144,6 +144,7 @@ struct ngx_http_upstream_check_peer_s {
 
 typedef struct {
     ngx_str_t                                check_shm_name;
+    ngx_uint_t                               generation;
     ngx_uint_t                               checksum;
     ngx_array_t                              peers;
 
@@ -403,6 +404,8 @@ static void ngx_http_upstream_check_finish_handler(ngx_event_t *event);
 
 static ngx_int_t ngx_http_upstream_check_need_exit();
 static void ngx_http_upstream_check_clear_all_events();
+static void ngx_http_upstream_check_clear_peers_events(
+    ngx_http_upstream_check_peers_t *peers);
 
 static ngx_int_t ngx_http_upstream_check_status_handler(
     ngx_http_request_t *r);
@@ -464,8 +467,8 @@ static char *ngx_http_upstream_check_init_shm(ngx_conf_t *cf, void *conf);
 
 static ngx_int_t ngx_http_upstream_check_get_shm_name(ngx_str_t *shm_name,
     ngx_pool_t *pool, ngx_uint_t generation);
-static ngx_shm_zone_t *ngx_shared_memory_find(ngx_cycle_t *cycle,
-    ngx_str_t *name, void *tag);
+static ngx_shm_zone_t *ngx_http_upstream_check_find_shm_zone(
+    ngx_cycle_t *cycle, void *tag);
 static ngx_http_upstream_check_peer_shm_t *
 ngx_http_upstream_check_find_shm_peer(ngx_http_upstream_check_peers_shm_t *peers_shm,
     ngx_addr_t *addr);
@@ -479,6 +482,7 @@ static ngx_int_t ngx_http_upstream_check_init_shm_zone(
     ngx_shm_zone_t *shm_zone, void *data);
 
 
+static ngx_int_t ngx_http_upstream_check_init_module(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_upstream_check_init_process(ngx_cycle_t *cycle);
 
 
@@ -567,7 +571,7 @@ ngx_module_t  ngx_http_upstream_check_module = {
     ngx_http_upstream_check_commands,      /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL,                                  /* init master */
-    NULL,                                  /* init module */
+    ngx_http_upstream_check_init_module,   /* init module */
     ngx_http_upstream_check_init_process,  /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
@@ -761,6 +765,8 @@ static ngx_check_status_command_t ngx_check_status_commands[] =  {
 
 static ngx_uint_t ngx_http_upstream_check_shm_generation = 0;
 static ngx_http_upstream_check_peers_t *check_peers_ctx = NULL;
+/* peers of the configuration being loaded, used until it is committed */
+static ngx_http_upstream_check_peers_t *check_peers_conf = NULL;
 
 
 ngx_uint_t
@@ -1062,7 +1068,7 @@ ngx_http_upstream_check_begin_handler(ngx_event_t *event)
 
     ngx_shmtx_lock(&peer->shm->mutex);
 
-    if (peers_shm->generation != ngx_http_upstream_check_shm_generation) {
+    if (peers_shm->generation != peers->generation) {
         ngx_shmtx_unlock(&peer->shm->mutex);
         return;
     }
@@ -2623,11 +2629,6 @@ ngx_http_upstream_check_need_exit()
 static void
 ngx_http_upstream_check_clear_all_events()
 {
-    ngx_uint_t                       i;
-    ngx_connection_t                *c;
-    ngx_http_upstream_check_peer_t  *peer;
-    ngx_http_upstream_check_peers_t *peers;
-
     static ngx_flag_t                has_cleared = 0;
 
     if (has_cleared || check_peers_ctx == NULL) {
@@ -2639,7 +2640,17 @@ ngx_http_upstream_check_clear_all_events()
 
     has_cleared = 1;
 
-    peers = check_peers_ctx;
+    ngx_http_upstream_check_clear_peers_events(check_peers_ctx);
+}
+
+
+static void
+ngx_http_upstream_check_clear_peers_events(
+    ngx_http_upstream_check_peers_t *peers)
+{
+    ngx_uint_t                       i;
+    ngx_connection_t                *c;
+    ngx_http_upstream_check_peer_t  *peer;
 
     peer = peers->peers.elts;
     for (i = 0; i < peers->peers.nelts; i++) {
@@ -2877,7 +2888,7 @@ ngx_http_upstream_check_status_html_format(ngx_buf_t *b,
             "    <th>Check type</th>\n"
             "    <th>Check port</th>\n"
             "  </tr>\n",
-            count, ngx_http_upstream_check_shm_generation);
+            count, peers->generation);
 
     for (i = 0; i < peers->peers.nelts; i++) {
 
@@ -2964,7 +2975,7 @@ static void
 ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
     ngx_http_upstream_check_peers_t *peers, ngx_uint_t flag)
 {
-    ngx_uint_t                       count, i, last;
+    ngx_uint_t                       count, i;
     ngx_http_upstream_check_peer_t  *peer;
 
     peer = peers->peers.elts;
@@ -2995,9 +3006,8 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
             "  \"generation\": %ui,\n"
             "  \"server\": [\n",
             count,
-            ngx_http_upstream_check_shm_generation);
+            peers->generation);
 
-    last = peers->peers.nelts - 1;
     for (i = 0; i < peers->peers.nelts; i++) {
 
         if (flag & NGX_CHECK_STATUS_DOWN) {
@@ -3031,7 +3041,7 @@ ngx_http_upstream_check_status_json_format(ngx_buf_t *b,
                 peer[i].shm->fall_count,
                 &peer[i].conf->check_type_conf->name,
                 peer[i].conf->port,
-                (i == last) ? "" : ",");
+                (--count == 0) ? "" : ",");
     }
 
     b->last = ngx_snprintf(b->last, b->end - b->last,
@@ -3112,7 +3122,7 @@ ngx_http_upstream_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             s.data = value[i].data + 5;
 
             port = ngx_atoi(s.data, s.len);
-            if (port == (ngx_uint_t) NGX_ERROR || port == 0) {
+            if (port == (ngx_uint_t) NGX_ERROR || port > 65535) {
                 goto invalid_check_parameter;
             }
 
@@ -3750,12 +3760,17 @@ ngx_http_upstream_check_init_shm(ngx_conf_t *cf, void *conf)
                        shm_name, shm_size);
 
         shm_zone->data = cf->pool;
-        check_peers_ctx = ucmcf->peers;
+        ucmcf->peers->generation = ngx_http_upstream_check_shm_generation;
+
+        /*
+         * Don't touch check_peers_ctx here: this configuration may still
+         * fail to load, and the running cycle must keep its own peers.
+         * check_peers_ctx is switched in init_module once the new cycle
+         * is committed.
+         */
+        check_peers_conf = ucmcf->peers;
 
         shm_zone->init = ngx_http_upstream_check_init_shm_zone;
-    }
-    else {
-         check_peers_ctx = NULL;
     }
 
     return NGX_CONF_OK;
@@ -3786,7 +3801,6 @@ static ngx_int_t
 ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
     size_t                               size;
-    ngx_str_t                            oshm_name;
     ngx_int_t                            rc;
     ngx_uint_t                           i, same, number;
     ngx_pool_t                          *pool;
@@ -3800,10 +3814,9 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 
     opeers_shm = NULL;
     peers_shm = NULL;
-    ngx_str_null(&oshm_name);
 
     same = 0;
-    peers = check_peers_ctx;
+    peers = check_peers_conf;
     if (peers == NULL) {
         return NGX_OK;
     }
@@ -3835,13 +3848,16 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
 
         if (ngx_http_upstream_check_shm_generation > 1) {
 
-            ngx_http_upstream_check_get_shm_name(&oshm_name,
-                    pool, ngx_http_upstream_check_shm_generation - 1);
-
-            /* The global variable ngx_cycle still points to the old one */
-            oshm_zone = ngx_shared_memory_find((ngx_cycle_t *) ngx_cycle,
-                                               &oshm_name,
-                                               &ngx_http_upstream_check_module);
+            /*
+             * The global variable ngx_cycle still points to the old one.
+             * Look the old zone up by tag rather than by generation
+             * number: a reload that failed after parsing still bumped
+             * the generation, so "generation - 1" may not be the zone
+             * the running cycle is actually using.
+             */
+            oshm_zone = ngx_http_upstream_check_find_shm_zone(
+                            (ngx_cycle_t *) ngx_cycle,
+                            &ngx_http_upstream_check_module);
 
             if (oshm_zone) {
                 opeers_shm = oshm_zone->data;
@@ -3865,7 +3881,7 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         ngx_memzero(peers_shm, size);
     }
 
-    peers_shm->generation = ngx_http_upstream_check_shm_generation;
+    peers_shm->generation = peers->generation;
     peers_shm->checksum = peers->checksum;
     peers_shm->number = number;
 
@@ -3874,6 +3890,12 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
     for (i = 0; i < number; i++) {
 
         peer_shm = &peers_shm->peers[i];
+
+        /*
+         * Set it here rather than in init_process, so that it is valid
+         * in every process type, including "master_process off".
+         */
+        peer[i].shm = peer_shm;
 
         /*
          * This function may be triggered before the old stale
@@ -3937,7 +3959,7 @@ failure:
 
 
 static ngx_shm_zone_t *
-ngx_shared_memory_find(ngx_cycle_t *cycle, ngx_str_t *name, void *tag)
+ngx_http_upstream_check_find_shm_zone(ngx_cycle_t *cycle, void *tag)
 {
     ngx_uint_t        i;
     ngx_shm_zone_t   *shm_zone;
@@ -3957,16 +3979,7 @@ ngx_shared_memory_find(ngx_cycle_t *cycle, ngx_str_t *name, void *tag)
             i = 0;
         }
 
-        if (name->len != shm_zone[i].shm.name.len) {
-            continue;
-        }
-
-        if (ngx_strncmp(name->data, shm_zone[i].shm.name.data, name->len) != 0)
-        {
-            continue;
-        }
-
-        if (tag != shm_zone[i].tag) {
+        if (tag != shm_zone[i].tag || shm_zone[i].data == NULL) {
             continue;
         }
 
@@ -4057,11 +4070,51 @@ ngx_http_upstream_check_init_shm_peer(ngx_http_upstream_check_peer_shm_t *psh,
 
 
 static ngx_int_t
+ngx_http_upstream_check_init_module(ngx_cycle_t *cycle)
+{
+    ngx_http_upstream_check_peers_t     *peers;
+    ngx_http_upstream_check_main_conf_t *ucmcf;
+
+    /*
+     * The new cycle is committed at this point.  Switch to its peers only
+     * now, so that a reload which fails after parsing leaves the running
+     * peers in place for the workers the master may still respawn.
+     */
+
+    peers = NULL;
+
+    ucmcf = ngx_http_cycle_get_module_main_conf(cycle,
+                                                ngx_http_upstream_check_module);
+    if (ucmcf != NULL && ucmcf->peers->peers.nelts > 0) {
+        peers = ucmcf->peers;
+    }
+
+    /*
+     * With "master_process off", nginx reloads in the same process and
+     * does not call init_process again.  Stop the old cycle's checks: its
+     * shared memory is about to be freed.
+     */
+    if (ngx_process == NGX_PROCESS_SINGLE
+        && check_peers_ctx != NULL && check_peers_ctx != peers)
+    {
+        ngx_http_upstream_check_clear_peers_events(check_peers_ctx);
+    }
+
+    check_peers_ctx = peers;
+    check_peers_conf = NULL;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_http_upstream_check_init_process(ngx_cycle_t *cycle)
 {
     ngx_http_upstream_check_main_conf_t *ucmcf;
 
-    if (ngx_process != NGX_PROCESS_WORKER) {
+    if (ngx_process != NGX_PROCESS_WORKER
+        && ngx_process != NGX_PROCESS_SINGLE)
+    {
         return NGX_OK;
     }
 
