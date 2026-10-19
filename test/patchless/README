@@ -31,4 +31,20 @@ checked, that dead ones get no traffic, that they recover, that removed
 ones have their check slots released, and that state is kept over a
 reload.
 
-common.py holds the helpers shared by resolve_test.py and upsync_test.py.
+nginx built --with-stream also gets the stream tests, which proxy raw TCP
+to the same backends:
+
+    python3 stream_test.py <build> rr|hash|chash|least_conn|random|random2 0|1
+
+checks a stream upstream with an http check, one with a tcp check and one
+with a backup server, next to an http upstream of the same name: no
+connection reaches B, C or D while they are down, B and C get connections
+again once they recover, the status page lists the stream servers with
+"upstream_type": "stream", state is kept over a reload, and checks keep
+running with check_keepalive_requests > 1. stream_resolve_test.py (nginx
+1.27.3+) is resolve_test.py for a stream upstream, with the http block
+first, and stream_upsync_test.py is upsync_test.py for a stream upstream
+with nginx-stream-upsync-module
+(https://github.com/xiaokai-wang/nginx-stream-upsync-module).
+
+common.py holds the helpers shared by the tests other than run_test.py.

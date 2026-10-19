@@ -38,14 +38,53 @@ if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_upstream_check_module
     ngx_module_incs="$ngx_addon_dir"
-    ngx_module_deps="$ngx_addon_dir/ngx_http_upstream_check_module.h"
+    ngx_module_deps="$ngx_addon_dir/ngx_http_upstream_check_module.h \
+                     $ngx_addon_dir/ngx_upstream_check.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_upstream_check_module.c"
 
     . auto/module
+
+    # stream { upstream {} } checks, using the check engine of the http
+    # module: a separate dynamic module, to be loaded after the http one
+
+    ngx_http_upstream_check_stream=no
+
+    if [ $ngx_http_upstream_check_patched = yes ]; then
+        if [ "$STREAM" != NO ]; then
+            echo " + ngx_stream_upstream_check_module: skipped, it needs" \
+                 "stock nginx (no check patch)"
+        fi
+
+    elif [ "$STREAM" = YES ]; then
+        ngx_http_upstream_check_stream=yes
+
+    elif [ "$STREAM" = DYNAMIC ]; then
+        if [ "$ngx_module_link" = DYNAMIC ]; then
+            ngx_http_upstream_check_stream=yes
+        else
+            echo " + ngx_stream_upstream_check_module: skipped, the stream" \
+                 "module is dynamic: use --add-dynamic-module"
+        fi
+    fi
+
+    if [ $ngx_http_upstream_check_stream = yes ]; then
+        ngx_module_type=STREAM
+        ngx_module_name=ngx_stream_upstream_check_module
+        ngx_module_incs="$ngx_addon_dir"
+        ngx_module_deps="$ngx_addon_dir/ngx_upstream_check.h"
+        ngx_module_srcs="$ngx_addon_dir/ngx_stream_upstream_check_module.c"
+        ngx_module_libs=
+        ngx_module_order=
+
+        . auto/module
+
+        echo " + ngx_stream_upstream_check_module: enabled"
+    fi
 
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_upstream_check_module"
     HTTP_INCS="$HTTP_INCS $ngx_addon_dir"
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS $ngx_addon_dir/ngx_http_upstream_check_module.h"
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $ngx_addon_dir/ngx_upstream_check.h"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_upstream_check_module.c"
 fi

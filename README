@@ -39,8 +39,25 @@ Synopsis
 
     }
 
+    stream {
+
+        upstream db {
+            server 192.168.0.1:3306;
+            server 192.168.0.2:3306;
+
+            check interval=3000 rise=2 fall=5 timeout=1000 type=mysql;
+        }
+
+        server {
+            listen 3306;
+            proxy_pass db;
+        }
+    }
+
 Description
-    Add the support of health check with the upstream servers.
+    Add the support of health check with the upstream servers, in
+    http { upstream {} } and, without the core patch, in
+    stream { upstream {} } (see "Stream upstreams" below).
 
 Directives
   check
@@ -51,7 +68,7 @@ Directives
     default: *none, if parameters omitted, default parameters are
     interval=30000 fall=5 rise=2 timeout=1000 default_down=true type=tcp*
 
-    context: *upstream*
+    context: *upstream* (http, stream)
 
     description: Add the health check for the upstream servers.
 
@@ -92,13 +109,14 @@ Directives
 
         6.  *fastcgi* send a fastcgi request, receives and parses the
             fastcgi response to diagnose if the upstream server is alive.
+            This type is only available in http upstreams.
 
   check_http_send
     syntax: *check_http_send http_packet*
 
     default: *"GET / HTTP/1.0\r\n\r\n"*
 
-    context: *upstream*
+    context: *upstream* (http, stream)
 
     description: If you set the check type is http, then the check function
     will sends this http packet to check the upstream server.
@@ -109,7 +127,7 @@ Directives
 
     default: *http_2xx | http_3xx*
 
-    context: *upstream*
+    context: *upstream* (http, stream)
 
     description: These status codes indicate the upstream server's http
     response is ok, the backend is alive.
@@ -119,7 +137,7 @@ Directives
 
     default: *check_keepalive_requests 1*
 
-    context: *upstream*
+    context: *upstream* (http, stream)
 
     description: The directive specifies the number of requests sent on a
     connection, the default vaule 1 indicates that nginx will certainly
@@ -130,7 +148,7 @@ Directives
 
     default: see below
 
-    context: *upstream*
+    context: *upstream* (http only)
 
     description: If you set the check type is fastcgi, then the check
     function will sends this fastcgi headers to check the upstream server.
@@ -145,11 +163,12 @@ Directives
 
     default: *1M*
 
-    context: *http*
+    context: *http*, *stream*
 
     description: Default size is one megabytes. If you check thousands of
     servers, the shared memory for health check may be not enough, you can
-    enlarge it with this directive.
+    enlarge it with this directive. The http and the stream upstreams share
+    one zone: if both blocks set it, the larger size is used.
 
   check_status
     syntax: *check_status [html|csv|json]*
@@ -170,6 +189,13 @@ Directives
         /hmstatus?format=html
         /hmstatus?format=csv
         /hmstatus?format=json
+
+    The servers of the stream upstreams are listed on the same page. The
+    last column ("Upstream type" in html, the last field in csv,
+    "upstream_type" in json) is "http" or "stream", since an http and a
+    stream upstream may have the same name. There is no check_status in
+    the stream block: put it in an http server, even if all the checked
+    upstreams are stream ones.
 
     At present, you can fetch the list of servers with the same status by
     the argument of `status`. For example:
@@ -192,6 +218,7 @@ Directives
                     <th>Fall counts</th>
                     <th>Check type</th>
                     <th>Check port</th>
+                    <th>Upstream type</th>
                     <td>0</td>
                     <td>backend</td>
                     <td>106.187.48.116:80</td>
@@ -200,10 +227,11 @@ Directives
                     <td>0</td>
                     <td>http</td>
                     <td>80</td>
+                    <td>http</td>
 
     Below it's the sample of csv page:
 
-        0,backend,106.187.48.116:80,up,46,0,http,80
+        0,backend,106.187.48.116:80,up,46,0,http,80,http
 
     Below it's the sample of json page:
 
@@ -211,7 +239,7 @@ Directives
           "total": 1,
           "generation": 3,
           "server": [
-           {"index": 0, "upstream": "backend", "name": "106.187.48.116:80", "status": "up", "rise": 58, "fall": 0, "type": "http", "port": 80}
+           {"index": 0, "upstream": "backend", "name": "106.187.48.116:80", "status": "up", "rise": 58, "fall": 0, "type": "http", "port": 80, "upstream_type": "http"}
           ]
          }}
 
@@ -238,6 +266,19 @@ Installation
     For the dynamic module, load it at the top of nginx.conf:
 
         load_module modules/ngx_http_upstream_check_module.so;
+
+    When nginx is configured with --with-stream, the checks for the stream
+    upstreams are built too, as ngx_stream_upstream_check_module. As a
+    dynamic module it is a separate file, which uses the http module and
+    must be loaded after it (and, with --with-stream=dynamic, after the
+    stream module):
+
+        load_module modules/ngx_stream_module.so;    # --with-stream=dynamic
+        load_module modules/ngx_http_upstream_check_module.so;
+        load_module modules/ngx_stream_upstream_check_module.so;
+
+    With --with-stream=dynamic, the stream checks are only built with
+    --add-dynamic-module. They are not built with the patched core.
 
 Note
     How it works without the patch: when the configuration is loaded, the
@@ -275,11 +316,24 @@ Note
         until the next sync, when it gets its "default_down" state, and a
         peer re-created by the resolver starts as up until the next sync.
 
-    *   nginx-upsync-module: servers in the file named by "upsync_dump_path"
-        are configured servers once nginx reloads, and stay checked (and
-        listed on the status page) until the next reload, even if upsync
-        removes them. Its own check hooks (NGX_HTTP_UPSTREAM_CHECK) are not
-        used, nor needed, without the patch.
+    *   nginx-upsync-module (and nginx-stream-upsync-module): servers in
+        the file named by "upsync_dump_path" are configured servers once
+        nginx reloads, and stay checked (and listed on the status page)
+        until the next reload, even if upsync removes them. Its own check
+        hooks (NGX_HTTP_UPSTREAM_CHECK) are not used, nor needed, without
+        the patch.
+
+    Stream upstreams: the "check" directives work the same way in
+    stream { upstream {} }, with the check types tcp, http, ssl_hello,
+    mysql and ajp. The stream round robin peers have the same "down" flag,
+    which the stream balancers (round robin, hash, hash consistent,
+    least_conn and random) honour, so the stream servers are checked and
+    marked down as above, with or without "zone", including servers added
+    at run time by "resolve" (nginx 1.27.3+) and by
+    nginx-stream-upsync-module. The check engine, its shared memory, the
+    slots for the run time servers and the status page are shared with the
+    http upstreams. The stream checks need stock nginx: with a patched
+    core they are not built.
 
     The tests for the unpatched mode are in test/patchless/.
 
