@@ -280,6 +280,44 @@ Installation
     With --with-stream=dynamic, the stream checks are only built with
     --add-dynamic-module. They are not built with the patched core.
 
+Choosing a method
+    The module can work on stock nginx (no patch, nginx 1.9.0+) or with a
+    patched nginx core (one of the check_*.patch files). The "config"
+    script picks the method by looking at the nginx sources: if the core
+    is patched it builds the patched method, otherwise the stock one.
+
+                                     stock nginx         patched core
+                                     (no patch)
+    nginx versions                   1.9.0+              any version with
+                                                         a matching patch
+    --add-dynamic-module             yes (1.9.11+)       no, --add-module only
+    re-patch for new nginx releases  no                  yes
+    http upstreams                   yes                 yes
+    stream upstreams                 yes                 no
+    servers added at run time        checked             not checked
+      ("resolve", nginx-upsync-module,
+      nginx-stream-upsync-module)
+    built-in balancers (round robin, yes                 yes (random: no)
+      hash, ip_hash, least_conn,
+      random)
+    third party balancers patched    no                  yes
+      for this module (upstream fair,
+      sticky, jvm_route)
+    a failed server leaves the       within one sync     on the next
+      balancers                      period (at most     request
+                                     500ms)
+
+    Use stock nginx unless you need nginx older than 1.9.0, or one of the
+    third party balancers patched for this module, or cannot accept a
+    failed server taking requests for up to one sync period. The run time
+    servers, the stream upstreams and the dynamic module are only
+    available on stock nginx.
+
+    With the patched core, nginx-upsync-module's own check hooks call
+    ngx_http_upstream_check_add_dynamic_peer(), which this module does not
+    provide, so nginx-upsync-module cannot be built together with this
+    module on a patched core.
+
 Note
     How it works without the patch: when the configuration is loaded, the
     module registers the servers of every upstream with "check" from the
@@ -291,7 +329,8 @@ Note
     skip peers with this flag set, with or without "zone". Servers marked
     "down" in the configuration are not checked and are never marked up.
 
-    Servers which show up in such an upstream at run time are checked too,
+    Servers which show up in such an upstream at run time are checked too
+    (on stock nginx only, the patched core does not check them),
     for example servers resolved with the "resolve" parameter (nginx
     1.27.3+) or added by nginx-upsync-module. The sync notices a peer it
     has no check for, and adds a check for its address in a slot of the
