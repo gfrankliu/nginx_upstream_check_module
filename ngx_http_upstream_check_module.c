@@ -95,6 +95,9 @@ typedef struct {
 
     ngx_pid_t                                owner;
 
+    /* the worker which keeps an idle check connection to the peer */
+    ngx_pid_t                                keepalive_owner;
+
     ngx_msec_t                               access_time;
 
     ngx_uint_t                               fall_count;
@@ -1260,7 +1263,7 @@ ngx_http_upstream_check_init_peer(ngx_http_upstream_check_peer_t *peer,
 static void
 ngx_http_upstream_check_begin_handler(ngx_event_t *event)
 {
-    ngx_msec_t                           interval;
+    ngx_msec_t                           interval, due;
     ngx_http_upstream_check_peer_t      *peer;
     ngx_http_upstream_check_peers_t     *peers;
     ngx_http_upstream_check_srv_conf_t  *ucscf;
@@ -1298,13 +1301,19 @@ ngx_http_upstream_check_begin_handler(ngx_event_t *event)
         return;
     }
 
-    interval = ngx_current_msec - peer->shm->access_time;
-    ngx_log_debug5(NGX_LOG_DEBUG_HTTP, event->log, 0,
-                   "http check begin handler index: %ui, owner: %P, "
-                   "ngx_pid: %P, interval: %M, check_interval: %M",
-                   peer->index, peer->shm->owner,
-                   ngx_pid, interval,
-                   ucscf->check_interval);
+    /*
+     * Another worker has checked the peer since this one kept its
+     * connection, so the connection would only stay idle. Close it, so
+     * that the peer does not get an idle check connection from every
+     * worker.
+     */
+
+    if (peer->pc.connection != NULL
+        && peer->shm->keepalive_owner != ngx_pid)
+    {
+        ngx_close_connection(peer->pc.connection);
+        peer->pc.connection = NULL;
+    }
 
     ngx_shmtx_lock(&peer->shm->mutex);
 
@@ -1313,7 +1322,43 @@ ngx_http_upstream_check_begin_handler(ngx_event_t *event)
         return;
     }
 
-    if ((interval >= ucscf->check_interval)
+    /*
+     * Read the access time under the lock: another worker may just have
+     * finished a check. The cached time of this worker may also be a bit
+     * behind the one the time was written with, which must not wrap around
+     * to a huge interval.
+     */
+
+    if ((ngx_msec_int_t) (ngx_current_msec - peer->shm->access_time) > 0) {
+        interval = ngx_current_msec - peer->shm->access_time;
+
+    } else {
+        interval = 0;
+    }
+
+    /*
+     * The worker which keeps an idle connection to the peer checks it next,
+     * the others only if it has not done so within half an interval more
+     * (its timer fires every half interval), e.g. when it has exited.
+     */
+
+    due = ucscf->check_interval;
+
+    if (peer->shm->keepalive_owner != NGX_INVALID_PID
+        && peer->shm->keepalive_owner != ngx_pid)
+    {
+        due += ucscf->check_interval / 2;
+    }
+
+    ngx_log_debug7(NGX_LOG_DEBUG_HTTP, event->log, 0,
+                   "http check begin handler index: %ui, owner: %P, "
+                   "keepalive owner: %P, ngx_pid: %P, interval: %M, "
+                   "due: %M, check_interval: %M",
+                   peer->index, peer->shm->owner,
+                   peer->shm->keepalive_owner, ngx_pid, interval, due,
+                   ucscf->check_interval);
+
+    if ((interval >= due)
          && (peer->shm->owner == NGX_INVALID_PID))
     {
         peer->shm->owner = ngx_pid;
@@ -2792,6 +2837,7 @@ ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer,
 static void
 ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
 {
+    ngx_uint_t                           keep;
     ngx_connection_t                    *c;
     ngx_http_upstream_check_srv_conf_t  *ucscf;
     ngx_check_conf_t                    *cf;
@@ -2799,6 +2845,8 @@ ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
     c = peer->pc.connection;
     ucscf = peer->conf;
     cf = ucscf->check_type_conf;
+
+    keep = 0;
 
     if (c) {
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
@@ -2810,6 +2858,8 @@ ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
         {
             c->write->handler = ngx_http_upstream_check_dummy_handler;
             c->read->handler = ngx_http_upstream_check_discard_handler;
+            keep = 1;
+
         } else {
             ngx_close_connection(c);
             peer->pc.connection = NULL;
@@ -2832,7 +2882,21 @@ ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
     }
 #endif
 
-    peer->shm->owner = NGX_INVALID_PID;
+    if (keep) {
+        peer->shm->keepalive_owner = ngx_pid;
+
+    } else if (peer->shm->keepalive_owner == ngx_pid) {
+        peer->shm->keepalive_owner = NGX_INVALID_PID;
+    }
+
+    /*
+     * The discard handler gets here too when the peer closes an idle
+     * connection, while another worker may be checking the peer.
+     */
+
+    if (peer->shm->owner == ngx_pid) {
+        peer->shm->owner = NGX_INVALID_PID;
+    }
 }
 
 
@@ -4250,6 +4314,7 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
         peer_shm = &peers_shm->peers[i];
 
         peer_shm->owner = NGX_INVALID_PID;
+        peer_shm->keepalive_owner = NGX_INVALID_PID;
 
         if (same) {
             continue;
@@ -4283,6 +4348,7 @@ ngx_http_upstream_check_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
          * pid.
          */
         peer_shm->owner = NGX_INVALID_PID;
+        peer_shm->keepalive_owner = NGX_INVALID_PID;
 
         if (same) {
             continue;
@@ -5224,6 +5290,7 @@ ngx_http_upstream_check_dyn_alloc(ngx_upstream_check_upstream_t *cu,
     ngx_memcpy(psh->dyn_name, np->name, np->name_len);
 
     psh->owner = NGX_INVALID_PID;
+    psh->keepalive_owner = NGX_INVALID_PID;
     psh->access_time = 0;
     psh->access_count = 0;
     psh->busyness = 0;
@@ -5304,6 +5371,12 @@ ngx_http_upstream_check_dyn_free(ngx_upstream_check_dyn_peer_t *dyn)
 
     if (peer->shm->dyn_id == peer->dyn_id && peer->shm->owner == ngx_pid) {
         peer->shm->owner = NGX_INVALID_PID;
+    }
+
+    if (peer->shm->dyn_id == peer->dyn_id
+        && peer->shm->keepalive_owner == ngx_pid)
+    {
+        peer->shm->keepalive_owner = NGX_INVALID_PID;
     }
 
     if (peer->pool) {
@@ -5389,6 +5462,7 @@ ngx_http_upstream_check_dyn_gc(void)
             psh->dyn_used = 0;
             psh->dyn_id++;
             psh->owner = NGX_INVALID_PID;
+            psh->keepalive_owner = NGX_INVALID_PID;
 
             ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
                           "release dynamic check peer %*s",
