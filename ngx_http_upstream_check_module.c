@@ -506,6 +506,7 @@ static void ngx_http_upstream_check_status_update(
 
 static void ngx_http_upstream_check_clean_event(
     ngx_http_upstream_check_peer_t *peer);
+static void ngx_http_upstream_check_reset_connection(ngx_connection_t *c);
 
 static void ngx_http_upstream_check_timeout_handler(ngx_event_t *event);
 static void ngx_http_upstream_check_finish_handler(ngx_event_t *event);
@@ -2854,6 +2855,30 @@ ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer,
 }
 
 
+/*
+ * A tcp check only connects, so it closes the connection with a reset
+ * (SO_LINGER 0) rather than a FIN. Otherwise every check would leave a
+ * socket in TIME_WAIT on the nginx side for 60 seconds, i.e. 60 / interval
+ * sockets per checked server.
+ */
+
+static void
+ngx_http_upstream_check_reset_connection(ngx_connection_t *c)
+{
+    struct linger  linger;
+
+    linger.l_onoff = 1;
+    linger.l_linger = 0;
+
+    if (setsockopt(c->fd, SOL_SOCKET, SO_LINGER,
+                   (const void *) &linger, sizeof(struct linger)) == -1)
+    {
+        ngx_log_error(NGX_LOG_ALERT, c->log, ngx_socket_errno,
+                      "setsockopt(SO_LINGER) failed");
+    }
+}
+
+
 static void
 ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
 {
@@ -2881,6 +2906,10 @@ ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
             keep = 1;
 
         } else {
+            if (cf->type == NGX_HTTP_CHECK_TCP) {
+                ngx_http_upstream_check_reset_connection(c);
+            }
+
             ngx_close_connection(c);
             peer->pc.connection = NULL;
         }

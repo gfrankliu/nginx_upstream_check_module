@@ -140,6 +140,10 @@ fork is otherwise in sync with upstream, up to and including
   [#275](https://github.com/yaoweibin/nginx_upstream_check_module/issues/275),
   [#285](https://github.com/yaoweibin/nginx_upstream_check_module/issues/285),
   [#287](https://github.com/yaoweibin/nginx_upstream_check_module/pull/287).
+- **`type=tcp` checks left sockets in TIME_WAIT.** Each check left a socket
+  in TIME_WAIT on the nginx side for 60 seconds (60 / interval sockets per
+  server). They now close with a reset, which leaves none. Fork
+  [#2](https://github.com/gfrankliu/nginx_upstream_check_module/issues/2).
 - **One idle check connection per worker.** With `check_keepalive_requests`
   > 1, a server could end up with an idle check connection from almost every
   worker (up to 64 with `worker_processes auto` on a 64 CPU host). It now
@@ -185,7 +189,10 @@ Adds health checks for the servers of the upstream. The parameters are:
 - `port`: the port to check on the servers. It can differ from the port of
   the server. The default, 0, means the port of the server.
 - `type`: the check protocol:
-  1. `tcp`: connects to the server and peeks one byte.
+  1. `tcp`: connects to the server and peeks one byte. The connection is
+     then closed with a reset (RST), so the checks leave no sockets in
+     TIME_WAIT. The server may log the check as a connection reset by the
+     peer.
   2. `ssl_hello`: sends an SSL client hello and receives the server hello.
   3. `http`: sends an HTTP request, then receives and parses the response
      to decide whether the server is alive.
